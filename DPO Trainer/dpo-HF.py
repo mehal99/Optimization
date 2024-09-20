@@ -31,7 +31,6 @@ def apply_lora(model, device):
     lora_config = LoraConfig(
         r=8,  # LoRA rank
         lora_alpha=32,  # Scaling factor for LoRA
-        target_modules=["c_attn"],  # Target layers to apply LoRA to
         lora_dropout=0.1,  # Dropout for regularization
         bias="none"  # Bias handling in LoRA
     )
@@ -78,10 +77,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=2003)
-    parser.add_argument("--model_name", type=str, default="gpt2")
+    parser.add_argument("--model_name", type=str, default="microsoft/phi-2")
     parser.add_argument("--dataset_name", type=str, default="jondurbin/truthy-dpo-v0.1")
     parser.add_argument("--wandb_project", type=str, default="dpo-HF")
-    parser.add_argument("--wandb_run", type=str, default="lora-eval-gpt2")
+    parser.add_argument("--wandb_run", type=str, default="lora-eval-phi-2")
     args = parser.parse_args()
 
     seed_everything(args.seed)
