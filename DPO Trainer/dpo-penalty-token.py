@@ -144,7 +144,7 @@ class CustomDPOTrainer(DPOTrainer):
 
         #Check constraint violation and update lambda
         self.lambda_val = max(self.lambda_val + self.step_size*(avg_bad_prob.item()-self.threshold), 0)
-        penalty = self.lambda_val * (avg_bad_prob.item() - self.threshold)/avg_bad_prob
+        # penalty = self.lambda_val * (avg_bad_prob.item() - self.threshold)/avg_bad_prob
 
         # constraint_violation = avg_bad_prob.item() > self.threshold
         # if constraint_violation:
@@ -152,7 +152,7 @@ class CustomDPOTrainer(DPOTrainer):
         # else:
         #     self.lambda_val = max(0.0, self.lambda_val - self.step_size)
 
-        total_loss = dpo_loss + self.lambda_val
+        total_loss = dpo_loss + penalty
 
         wandb.log({
             'dpo_loss': dpo_loss.item(),
