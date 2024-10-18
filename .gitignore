@@ -1,3 +1,5 @@
 wandb
 results
 model-HF-DPO.pt
+*.pt
+data/
