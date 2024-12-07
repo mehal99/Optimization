@@ -3,3 +3,6 @@ results
 model-HF-DPO.pt
 *.pt
 data/
+training_logs/
+*.err
+*.out
