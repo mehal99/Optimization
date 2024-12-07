@@ -11,6 +11,7 @@ import wandb
 import pandas as pd
 import gc
 import os
+from datetime import datetime
 
 gc.collect()
 torch.cuda.empty_cache()
@@ -22,57 +23,23 @@ def seed_everything(seed=2003):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-# def load_bad_words(tokenizer):
-#     df = pd.read_csv('jigsaw-toxic-comment-classification-challenge/train.csv')
-#     bad_responses = df[df['toxic'] == 1]['comment_text'].tolist() 
-#     #Extract bad words instead of complete bad responses (memory issues)
-#     bad_words_set = set()
-#     for response in bad_responses:
-#         words = response.strip().split()
-#         bad_words_set.update(words)
-#     bad_words = [word for word in bad_words_set if word]
-    
-#     #Seeting a maximum number of bad words (memory issues)
-#     max_bad_words = 300  
-#     if len(bad_words) > max_bad_words:
-#         bad_words = random.sample(bad_words, max_bad_words)
-    
-#     print("Bad words set: ", bad_words)
-#     #Tokenize bad words
-#     bad_token_ids = []
-#     for word in bad_words:
-#         token_ids = tokenizer.encode(word, add_special_tokens=False)
-#         bad_token_ids.extend(token_ids)
-#     #Remove duplicates
-#     bad_token_ids = list(set(bad_token_ids))
-    
-#     return bad_token_ids
-
-
 def load_bad_words(tokenizer):
-    # df = pd.read_csv('bad_words.csv', header=None, names=['bad_words'])
-    df = pd.read_csv('data\\fixed_normal_words.csv', header=0, names=['normal_words'])
+    df = pd.read_csv('./data/intel_fixed_normal_words_300.csv', header=0, names=['normal_words'])
     bad_words = df['normal_words'].tolist()
     bad_words = [word.lower() for word in bad_words if isinstance(word, str)]
     bad_words = list(set(bad_words))
-    # max_bad_words = 300
-    # if len(bad_words) > max_bad_words:
-    #     bad_words = random.sample(bad_words, max_bad_words)
-    # print("Bad words set: ", bad_words)  
     print("Normal words set: ", bad_words)  
-    # Tokenize bad words
+    # Tokenize restricted words
     bad_token_ids = []
     for word in bad_words:
         token_ids = tokenizer.encode(word, add_special_tokens=False)
         bad_token_ids.extend(token_ids)
-    
-    # Remove duplicates
     bad_token_ids = list(set(bad_token_ids))
     return bad_token_ids
 
 def preprocess_data(item):
     return {
-        'prompt': 'Instruct: ' + item['prompt'] + '\n',
+        'prompt': 'Instruct: ' + item['question'] + '\n',
         'chosen': 'Output: ' + item['chosen'],
         'rejected': 'Output: ' + item['rejected']
     }
@@ -81,13 +48,12 @@ def apply_lora(model):
     lora_config = LoraConfig(
         r=4,
         lora_alpha=32,
-        lora_dropout=0.1,
-        bias="none"
+        lora_dropout=0.05
     )
     model = get_peft_model(model, lora_config)
     return model
 
-def compute_penalty(model, input_ids, attention_mask, bad_token_ids, lambda_val, prompt_length):
+def compute_penalty(model, input_ids, attention_mask, bad_token_ids, lambda_val, prompt_length, threshold):
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     logits = outputs.logits  #[batch_size, seq_len, vocab_size]
     probs = torch.softmax(logits, dim=-1) 
@@ -96,13 +62,11 @@ def compute_penalty(model, input_ids, attention_mask, bad_token_ids, lambda_val,
         bad_token_ids = torch.tensor(bad_token_ids).to(input_ids.device)
     
     # Compute probabilities assigned to bad tokens
-    bad_token_probs = response_probs.index_select(dim=-1, index=bad_token_ids) # Shape: [batch_size, response_seq_len, num_bad_tokens]
+    bad_token_probs = response_probs[:, :, bad_token_ids] # Shape: [batch_size, response_seq_len, num_bad_tokens]
     #Sum up the probabilities assigned to bad tokens at each position in the response 
     total_bad_probs = bad_token_probs.sum(dim=-1)  # Shape: [batch_size, seq_len]
-
     # average probability assigned to bad tokens across all positions and sequences
     avg_bad_prob = total_bad_probs.mean()
-
     # penalty
     penalty = lambda_val * avg_bad_prob
 
@@ -140,23 +104,15 @@ class CustomDPOTrainer(DPOTrainer):
         
         # Compute penalty
         prompt_length = prompt_input_ids.size(1)
-        penalty, avg_bad_prob = compute_penalty(model=model, input_ids=input_ids, attention_mask=attention_mask, bad_token_ids=self.bad_token_ids, lambda_val=self.lambda_val, prompt_length=prompt_length)
+        penalty, avg_bad_prob = compute_penalty(model=model, input_ids=input_ids, attention_mask=attention_mask, bad_token_ids=self.bad_token_ids, lambda_val=self.lambda_val, prompt_length=prompt_length, threshold=self.threshold)
 
         #Check constraint violation and update lambda
         self.lambda_val = max(self.lambda_val + self.step_size*(avg_bad_prob.item()-self.threshold), 0)
-        # penalty = self.lambda_val * (avg_bad_prob.item() - self.threshold)/avg_bad_prob
-
-        # constraint_violation = avg_bad_prob.item() > self.threshold
-        # if constraint_violation:
-        #     self.lambda_val += self.step_size
-        # else:
-        #     self.lambda_val = max(0.0, self.lambda_val - self.step_size)
-
         total_loss = dpo_loss + penalty
 
         wandb.log({
             'dpo_loss': dpo_loss.item(),
-            'penalty': penalty,
+            'penalty': penalty.item(),
             'total_loss': total_loss.item(),
             'lambda_val': self.lambda_val,
             'avg_bad_prob': avg_bad_prob.item()
@@ -172,23 +128,24 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lambda_penalty", type=float, default=0.1)
     parser.add_argument("--step_size", type=float, default=0.01)
     parser.add_argument("--threshold", type=float, default=0.0001)
     parser.add_argument("--seed", type=int, default=2003)
-    parser.add_argument("--model_name", type=str, default="gpt2")
-    parser.add_argument("--dataset_name", type=str, default="jondurbin/truthy-dpo-v0.1")
-    parser.add_argument("--wandb_project", type=str, default="dpo_penalty_2")
+    parser.add_argument("--model_name", type=str, default="gpt2-medium") #gpt-2 with truthy-dpo
+    parser.add_argument("--dataset_name", type=str, default="Intel/orca_dpo_pairs")     # jondurbin/truthy-dpo-v0.1
+    parser.add_argument("--wandb_project", type=str, default="dpo_gpu_exps_20241205_intel_0.00001_final")
     args = parser.parse_args()
-
+    print(args)
     seed_everything(args.seed)
 
-    wandb.login(key="5ac851d8254d920a4610373723ddd35d19cbd2e8")  
-    wandb.init(project=args.wandb_project, config=args)
+    wandb.login()  
+    wandb_run_name = f"constr-dpo:lam:{args.lambda_penalty}-bs:{args.batch_size}-thres:{args.threshold}-step:{args.step_size}-epochs:{args.epochs}"
+    wandb.init(project=args.wandb_project, name=wandb_run_name, config=args)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding=True, truncation=True)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -196,9 +153,9 @@ def main():
     ref_model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
     model = apply_lora(base_model)
 
-    # Data Loading and preprecessing
-    train_dataset = load_dataset(args.dataset_name, split="train[:80%]")
-    val_dataset = load_dataset(args.dataset_name, split="train[80%:]")
+    # Data Loading and preprecessing for Intel/orca_dpo_pairs (subset)
+    train_dataset = load_dataset(args.dataset_name, split="train[:10%]")
+    val_dataset = load_dataset(args.dataset_name, split="train[10%:13%]")
     train_dataset = train_dataset.map(preprocess_data)
     val_dataset = val_dataset.map(preprocess_data)    
 
@@ -219,7 +176,7 @@ def main():
         weight_decay=0.01,
         lr_scheduler_type="linear",
         warmup_steps=100,
-        eval_steps=10,
+        eval_steps=100,
         evaluation_strategy="steps",
         logging_dir='./logs',
         logging_strategy="steps"
@@ -244,7 +201,9 @@ def main():
     )
 
     trainer.train()
-    model.save_pretrained(f"model-HF-Constrained-DPO-{args.lambda_penalty}-{args.threshold}-{args.step_size}.pt")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    model_save_path = f"constrained-DPO-intel-lam:{args.lambda_penalty}-thres:{args.threshold}-step:{args.step_size}-epochs:{args.epochs}-{timestamp}.pt"
+    model.save_pretrained(model_save_path)
 
 if __name__ == "__main__":
     main()
